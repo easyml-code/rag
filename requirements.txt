@@ -1,0 +1,26 @@
+# Web framework
+fastapi
+uvicorn[standard]
+python-multipart
+
+# PDF processing
+pdfplumber
+camelot-py
+pypdfium2
+pillow
+tiktoken
+
+# OCR
+python-doctr[torch]
+transformers
+torch
+
+# Embeddings + LLM
+langchain-google-genai
+langgraph
+
+# Vector DB
+chromadb>=0.5.0
+
+# Config
+pydantic-settings>=2.0.0
