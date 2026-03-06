@@ -1,127 +1,168 @@
 # RAG PDF API
 
-FastAPI service for PDF chunking, indexing, retrieval, and citation-grounded chat.
+FastAPI service for PDF ingestion, indexing, retrieval, and citation grounded chat.
 
-This project ingests PDF files, generates structured chunks with OCR and image support, stores embeddings in Chroma, stores searchable text in SQLite FTS5, and serves query/chat APIs on top of that data.
+## Overview
 
-## What this project does
+This project builds a document RAG system over PDF files.
 
-- Chunks PDF documents (`ppt`, `non_ppt`, `image_only` modes).
-- Runs OCR for scanned/image-heavy content.
-- Stores vectors in Chroma persistent storage.
-- Stores chunk text and metadata in SQLite + FTS5 (BM25 search).
-- Retrieves relevant chunks with optional image references or image blobs.
-- Runs a LangGraph chat pipeline with inline source citations like `MW[1]`.
+- It chunks PDF content into structured units.
+- It runs OCR for scanned pages and visual regions.
+- It stores embeddings in Chroma.
+- It stores searchable text in SQLite with FTS5 BM25.
+- It serves retrieval and chat endpoints on top of indexed data.
+- It supports two chat paths:
+- `POST /chat`: fixed LangGraph RAG flow.
+- `POST /agent_chat`: tool calling agent with chat memory and optional Supabase persistence.
 
-## Architecture
+## End to End Flow
 
-### Ingestion and indexing
+### 1) Ingestion and indexing
 
-1. `POST /chunk` receives a PDF upload.
-2. File is saved to `data/tmp/`.
-3. `PDFChunker` extracts chunks and image artifacts.
-4. `embed_and_store` writes:
-5. Vectors and lightweight metadata to Chroma.
-6. Text and full metadata to SQLite + FTS5.
+`POST /chunk` runs:
 
-### Retrieval
+1. Save uploaded PDF to `data/tmp`.
+2. Chunk with `PDFChunker` (`ppt`, `non_ppt`, `image_only`).
+3. Save extracted images to `data/images/{pdf_stem}`.
+4. Clean and embed chunk text.
+5. Store vectors in Chroma.
+6. Store text and metadata in SQLite + FTS5.
+7. Return indexing manifest JSON.
 
-1. `POST /retrieve` embeds the query.
-2. Vector search always runs on Chroma.
-3. Optional BM25 search runs on SQLite FTS5.
-4. Optional image references or blobs are attached to each hit.
+### 2) Retrieval
 
-### Chat agent (LangGraph)
+`POST /retrieve` runs:
 
-Graph path:
+1. Embed query.
+2. Vector search in Chroma.
+3. Optional BM25 text search in SQLite FTS5.
+4. Optional image payload attachment (`ref` or `blob`).
+5. Return `vector_results` and optional `text_results`.
+
+### 3) Agent layers
+
+`POST /chat` graph:
 
 1. `retriever`
-2. Conditional edge:
-3. If `images=true` -> `image_blob_loader`
-4. Else -> `llm`
-5. `llm` -> `citation_validation` -> `output`
+2. conditional route:
+3. if `images=true`: `image_blob_loader`
+4. then `llm`
+5. `citation_validation`
+6. `output`
 
-Citation rules are enforced in prompt and validator. If evidence is missing, the expected fallback is:
+`POST /agent_chat` graph:
+
+1. `input` (history load from memory and optional DB)
+2. `llm_node` (tool calling)
+3. `tool_node` (`retrieve` tool, max 5 calls)
+4. `citation_validation`
+5. `save_node` (response assembly and optional DB write)
+
+If evidence is not available, both chat flows can return:
 
 `Not found in the document.`
 
-## Repository layout
+## Storage
+
+### Local storage
+
+Default paths under `DATA_DIR` (`./data` by default):
 
 ```text
-app.py                   # FastAPI app and API endpoints
-config.py                # Runtime settings + ChunkingConfig
-chunker/                 # PDF chunking pipeline
-store/                   # Vector store (Chroma) + text store (SQLite/FTS)
-retriever/               # Retrieval orchestration + image payload loading
-agent/                   # LangGraph chat pipeline nodes and state
-llm/                     # LLM client (Google Gemini via LangChain)
-log/                     # Logger setup
-data/                    # Local runtime data (created automatically)
+data/
+  chroma/                 # Chroma vector store
+  db/
+    rag_chunks.db         # SQLite tables + FTS5 index
+  images/                 # Extracted page and crop images
+  tmp/                    # Uploaded PDFs kept on disk
+logs/
+  app.log                 # Rotating logs
+```
+
+### What is stored where
+
+- Chroma stores vectors and lightweight metadata per chunk.
+- SQLite stores full chunk text and JSON metadata for BM25 search.
+- Image files are saved on disk and linked by relative `image_path`.
+- Chat memory for `agent_chat` is cached in process memory.
+- If Supabase is configured and available, chat turns are also persisted to DB.
+
+## Project Structure
+
+```text
+src/
+  app.py                              # FastAPI app and core endpoints
+  api/agent_chat.py                   # /agent_chat router
+  config.py                           # Settings and ChunkingConfig
+  components/
+    ingestion/
+      chunker/                        # PDF chunking, OCR, image capture
+      store/                          # Chroma and SQLite write/read layers
+    retriever/                        # Retrieval orchestration
+    utils/embeddings.py               # Embedding helpers
+  agents/
+    rag/                              # Fixed graph chat flow for /chat
+    agentic_rag/                      # Tool calling chat flow for /agent_chat
+  llm/llm.py                          # Gemini client
+  log/logs.py                         # Logger config
 ```
 
 ## Requirements
 
 - Python 3.11 recommended.
-- A Google API key with access to Gemini and embedding models.
-- System dependencies for PDF/OCR as needed by your chosen engines:
-- `pdfplumber`, `pypdfium2`, `camelot` stack
-- OCR engines such as docTR/Tesseract/EasyOCR/PaddleOCR
+- Google API key for LLM and embedding models.
+- PDF and OCR dependencies from `requirements.txt`.
 
-## Installation
+## Setup
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-```
-
-## Configuration
-
-Copy and edit environment variables:
-
-```bash
 cp .env.example .env
 ```
 
-Minimum required values in `.env`:
+Minimum required `.env`:
 
 ```env
-GOOGLE_API_KEY=your_google_api_key
+GOOGLE_API_KEY=your_google_api_key_here
 LLM_MODEL=models/gemini-2.5-flash
 LLM_MAX_TOKENS=10000
 LLM_TEMPERATURE=0
 ```
 
-Important optional variables:
+Optional `.env` keys:
 
-- `EMBEDDING_MODEL` (default: `models/gemini-embedding-001`)
-- `EMBED_BATCH_SIZE` (default: `100`)
-- `DATA_DIR` (default: `./data`)
-- `CHROMA_DIR` (default: `${DATA_DIR}/chroma`)
-- `SQLITE_PATH` (default: `${DATA_DIR}/db/rag_chunks.db`)
-- `IMAGES_DIR` (default: `${DATA_DIR}/images`)
-- `TMP_DIR` (default: `${DATA_DIR}/tmp`)
-- `CHROMA_COLLECTION` (default: `rag_chunks`)
-- `HF_TOKEN` (optional, used by LightOnOCR path)
+- `EMBEDDING_MODEL`
+- `EMBED_BATCH_SIZE`
+- `DATA_DIR`
+- `CHROMA_DIR`
+- `SQLITE_PATH`
+- `IMAGES_DIR`
+- `TMP_DIR`
+- `CHROMA_COLLECTION`
+- `SUPABASE_URL`
+- `SUPABASE_KEY`
 
-## Run the API
+## Run
 
 ```bash
-uvicorn app:app --reload
+uvicorn src.app:app --reload
 ```
 
-On startup, the app creates required data directories automatically.
+Docs:
 
-## API reference
+- `http://127.0.0.1:8000/docs`
 
-### 1) `POST /chunk`
+## API
 
-Upload and index a PDF.
+### `POST /chunk`
 
-- Content type: `multipart/form-data`
-- Required field: `file` (PDF)
-- Optional fields: chunking and OCR parameters from `ChunkingConfig`
+`multipart/form-data`:
+
+- required: `file` (PDF)
+- optional: all chunking controls in `ChunkingConfig`
 
 Example:
 
@@ -132,17 +173,35 @@ curl -X POST "http://127.0.0.1:8000/chunk" \
   -F "granularity=page"
 ```
 
-Returns a manifest with `doc_id`, chunk counts, confidence breakdown, and token stats.
-
-### 2) `POST /retrieve`
-
-Retrieve top-k relevant chunks.
-
-Request body:
+Exact response JSON format:
 
 ```json
 {
-  "query": "module sales in Q1-25",
+  "doc_id": "string",
+  "source_file": "/absolute/path/to/saved/upload.pdf",
+  "pdf_type": "non_ppt",
+  "granularity": "page",
+  "table_strategy": "extract_then_markdown",
+  "table_engine": "pdfplumber",
+  "ocr_engine": "doctr",
+  "image_ocr": true,
+  "total_chunks": 0,
+  "chunks_by_type": {},
+  "chunks_by_page": {},
+  "extraction_confidence": {},
+  "avg_token_count": 0,
+  "max_token_count": 0,
+  "generated_at": "2026-03-07T00:00:00+00:00"
+}
+```
+
+### `POST /retrieve`
+
+Request JSON:
+
+```json
+{
+  "query": "string",
   "top_k": 5,
   "images": true,
   "image_payload": "ref",
@@ -150,34 +209,140 @@ Request body:
 }
 ```
 
-Notes:
-
-- `image_payload="ref"` returns path/size/media-type metadata.
-- `image_payload="blob"` returns raw image bytes (larger response).
-- `text_search=true` adds BM25 results from SQLite FTS5.
-
-### 3) `POST /chat`
-
-Ask a citation-grounded question over retrieved context.
-
-Request body:
+Exact response JSON key format when `images=true` and `text_search=true`:
 
 ```json
 {
-  "message": "What were Q1-25 module sales?",
+  "vector_results": [
+    {
+      "chunk_id": "string",
+      "text": "string",
+      "score": 0.0,
+      "doc_id": "string",
+      "page": 0,
+      "chunk_type": "text",
+      "image_path": "pdf_stem/p01_page_ocr_00.webp",
+      "section_title": "string",
+      "token_count": 0,
+      "extraction_confidence": "high",
+      "image_width_px": 0,
+      "image_height_px": 0,
+      "bbox": {
+        "x0": 0.0,
+        "y0": 0.0,
+        "x1": 0.0,
+        "y1": 0.0
+      },
+      "source_uri": "file:///abs/path/file.pdf",
+      "source_file": "/abs/path/file.pdf",
+      "filename": "original_upload.pdf",
+      "total_pages": 0,
+      "pdf_type": "non_ppt",
+      "created_at": "2026-03-07T00:00:00+00:00",
+      "doc_metadata": {},
+      "retrieval_type": "vector",
+      "images": {
+        "page_image": {
+          "key": "pdf_stem/p01_page_ocr_00.webp",
+          "path": "/abs/path/data/images/pdf_stem/p01_page_ocr_00.webp",
+          "size_bytes": 0,
+          "media_type": "image/webp"
+        },
+        "inline_images": [
+          {
+            "name": "image_0.webp",
+            "key": "pdf_stem/image_0.webp",
+            "path": "/abs/path/data/images/pdf_stem/image_0.webp",
+            "size_bytes": 0,
+            "media_type": "image/webp"
+          }
+        ]
+      }
+    }
+  ],
+  "text_results": [
+    {
+      "chunk_id": "string",
+      "text": "string",
+      "score": 0.0,
+      "doc_id": "string",
+      "page": 0,
+      "chunk_type": "text",
+      "image_path": "pdf_stem/p01_page_ocr_00.webp",
+      "section_title": "string",
+      "token_count": 0,
+      "extraction_confidence": "high",
+      "bbox": {
+        "x0": 0.0,
+        "y0": 0.0,
+        "x1": 0.0,
+        "y1": 0.0
+      },
+      "image_width_px": 0,
+      "image_height_px": 0,
+      "source_uri": "file:///abs/path/file.pdf",
+      "source_file": "/abs/path/file.pdf",
+      "total_pages": 0,
+      "pdf_type": "non_ppt",
+      "created_at": "2026-03-07T00:00:00+00:00",
+      "doc_metadata": {},
+      "retrieval_type": "text",
+      "images": {
+        "page_image": {
+          "key": "pdf_stem/p01_page_ocr_00.webp",
+          "path": "/abs/path/data/images/pdf_stem/p01_page_ocr_00.webp",
+          "size_bytes": 0,
+          "media_type": "image/webp"
+        },
+        "inline_images": []
+      }
+    }
+  ]
+}
+```
+
+Notes:
+
+- If `images=false`, `images` key is not attached to results.
+- If `text_search=false`, output may contain only `vector_results`.
+- If `image_payload="blob"`, each image object includes `"blob"` bytes.
+
+### `POST /chat`
+
+Request JSON:
+
+```json
+{
+  "message": "string",
   "top_k": 3,
   "images": true,
   "include_text": false
 }
 ```
 
-Response shape:
+Exact response JSON format:
 
 ```json
 {
-  "answer": "Module sales for Q1-25 were 1,001 MW[1].",
+  "answer": "string",
   "metadata": {
-    "sources": [],
+    "sources": [
+      {
+        "citation": 1,
+        "source_file": "/abs/path/file.pdf",
+        "filename": "original_upload.pdf",
+        "page": 0,
+        "chunk_type": "text",
+        "chunk_id": "string",
+        "bbox": {
+          "x0": 0.0,
+          "y0": 0.0,
+          "x1": 0.0,
+          "y1": 0.0
+        },
+        "text": "string"
+      }
+    ],
     "used_citations": [1],
     "usage": {
       "input_tokens": 0,
@@ -186,65 +351,96 @@ Response shape:
     },
     "images_sent": {
       "enabled": true,
-      "selected_count": 1,
-      "selected_citations": [1],
+      "selected_count": 0,
+      "selected_citations": [],
       "mode": "media_bytes",
-      "total_image_bytes": 123456
+      "total_image_bytes": 0
     }
   }
 }
 ```
 
-## Data storage
+### `POST /agent_chat`
 
-Default local storage layout:
+Request JSON:
 
-```text
-data/
-  chroma/                 # Chroma persistent files
-  db/
-    rag_chunks.db         # SQLite + FTS5 tables
-  images/                 # Stored page/crop images
-  tmp/                    # Uploaded PDFs kept on disk
-logs/
-  app.log                 # Rotating application logs
+```json
+{
+  "message": "string",
+  "top_k": 3,
+  "images": true,
+  "include_text": false,
+  "text_search": true,
+  "config": {
+    "chat_id": "string",
+    "session_id": "string"
+  }
+}
 ```
 
-## Logging
+Exact response JSON format:
 
-Logger is configured in `log/logs.py` with:
+```json
+{
+  "answer": "string",
+  "metadata": {
+    "history_turns_loaded": 0,
+    "sources": [
+      {
+        "citation": 1,
+        "source_file": "/abs/path/file.pdf",
+        "filename": "original_upload.pdf",
+        "page": 0,
+        "chunk_type": "text",
+        "chunk_id": "string",
+        "bbox": {
+          "x0": 0.0,
+          "y0": 0.0,
+          "x1": 0.0,
+          "y1": 0.0
+        },
+        "text": "string"
+      }
+    ],
+    "used_citations": [1],
+    "rephrased_queries": ["string"],
+    "citation_validation": {
+      "is_valid": true,
+      "issues": [],
+      "available_citations": [1],
+      "found_citations": [1],
+      "invalid_citations": []
+    },
+    "usage_metadata": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "total_tokens": 0,
+      "llm_calls": 0
+    },
+    "images_sent": {
+      "enabled": true,
+      "selected_count": 1,
+      "selected_citations": [1],
+      "mode": "tool_message_image_blocks",
+      "total_image_bytes": 12345
+    }
+  }
+}
+```
 
-- Console logs (colorized)
-- Rotating file logs (`logs/app.log`, 1 MB, 5 backups)
+Optional `usage_metadata` keys that may appear:
 
-## Troubleshooting
+- `internal_tokens`
+- `final_output_tokens`
+- `llm_calls_with_usage`
+- `input_token_details`
+- `output_token_details`
+- `per_call`
+- `aggregated_input_token_details`
+- `aggregated_output_token_details`
 
-### Chunks are not saved or DB is not created
+## Notes
 
-- Check that startup ran and created data directories.
-- Ensure `.env` has valid API credentials.
-- Check `logs/app.log` for `/chunk` exceptions.
-- Confirm write permissions for `DATA_DIR` and `logs/`.
-
-### `/retrieve` returns vector results but no text results
-
-- BM25 path may have failed. The app falls back to vector-only and logs a warning.
-- Verify SQLite file exists and FTS tables were initialized by a successful `/chunk`.
-
-### Chat is not using images
-
-- Check `metadata.images_sent.selected_count` in `/chat` response.
-- If `0` while `images=true`, image files were not loaded for the selected sources.
-- Ensure `image_path` points to existing files under `data/images/`.
-
-### `RequestsDependencyWarning` (urllib3/chardet/charset_normalizer mismatch)
-
-- This warning comes from the installed `requests` package in your virtual environment.
-- It indicates dependency version mismatch, not project logic error.
-- Reinstall pinned compatible versions of `requests` dependencies in the same venv.
-
-## Notes for contributors
-
-- Keep sensitive values in `.env` only.
-- Do not commit `data/`, `logs/`, virtualenv folders, or local cache files.
-- See `.gitignore` for ignored runtime artifacts.
+- Uploaded PDFs in `data/tmp` are intentionally kept on disk.
+- Clean `data/tmp` and other runtime data based on your retention policy.
+- For `agent_chat` DB persistence, install `supabase` and set `SUPABASE_URL` and `SUPABASE_KEY`.

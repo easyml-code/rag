@@ -494,7 +494,7 @@ async def save_node(state: AgenticRAGState) -> Dict[str, Any]:
 
     if chat_id and session_id:
         try:
-            await db.save_message(
+            scheduled = db.schedule_save_message(
                 chat_id=chat_id,
                 session_id=session_id,
                 human=user_input,
@@ -503,6 +503,16 @@ async def save_node(state: AgenticRAGState) -> Dict[str, Any]:
                 output_tokens=usage_metadata["output_tokens"],
                 internal_tokens=usage_metadata["internal_tokens"],
             )
+            if not scheduled:
+                await db.save_message(
+                    chat_id=chat_id,
+                    session_id=session_id,
+                    human=user_input,
+                    ai=answer,
+                    input_tokens=usage_metadata["input_tokens"],
+                    output_tokens=usage_metadata["output_tokens"],
+                    internal_tokens=usage_metadata["internal_tokens"],
+                )
         except Exception as exc:
             logger.warning("agentic_rag.db.save failed: %s", exc)
 

@@ -10,7 +10,7 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 from typing_extensions import Annotated
 
-from src.components.retriever.retriever import retrieve as do_retrieve
+from src.components import retrieve as do_retrieve
 from src.log.logs import logger
 
 

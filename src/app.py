@@ -22,6 +22,7 @@ Run:
 
 import re
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,34 +30,38 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from src.agents.agentic_rag.util import flush_pending_writes, persistence_status
+from src.agents.rag.graph import run_chat_agent
+from src.api.agent_chat import router as agent_chat_router
 from src.config import ChunkingConfig, ensure_data_dirs, settings
 from src.components.ingestion.chunker.chunker import PDFChunker
 from src.components.ingestion.store.indexer import embed_and_store
 from src.components.retriever.retriever import retrieve
-from src.agents.rag.graph import run_chat_agent
 from src.log.logs import logger
 
 
-app = FastAPI(title="RAG API", version="1.0.0")
-
-from src.api.agent_chat import router as agent_chat_router
-
-
-app.include_router(agent_chat_router)
-
-# ── Startup ───────────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-async def startup() -> None:
-    """Create all required data directories on first run."""
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    """App lifecycle: startup init + graceful shutdown flush."""
     ensure_data_dirs()
+    db_state = persistence_status()
     logger.info(
-        "data dirs ready  chroma=%s  db=%s  images=%s  tmp=%s",
+        "startup ready chroma=%s db=%s images=%s tmp=%s supabase_enabled=%s reason=%s",
         settings.chroma_dir,
         Path(settings.sqlite_path).parent,
         settings.images_dir,
         settings.tmp_dir,
+        db_state.get("enabled", False),
+        db_state.get("reason", ""),
     )
+    yield
+    flushed = await flush_pending_writes(timeout_sec=5.0)
+    if flushed:
+        logger.info("shutdown flushed_background_db_writes=%d", flushed)
+
+
+app = FastAPI(title="RAG API", version="1.0.0", lifespan=_lifespan)
+app.include_router(agent_chat_router)
 
 
 # ── Upload helper ─────────────────────────────────────────────────────────────
