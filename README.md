@@ -10,57 +10,94 @@ This project builds a document RAG system over PDF files.
 - It runs OCR for scanned pages and visual regions.
 - It stores embeddings in Chroma.
 - It stores searchable text in SQLite with FTS5 BM25.
-- It serves retrieval and chat endpoints on top of indexed data.
-- It supports two chat paths:
-- `POST /chat`: fixed LangGraph RAG flow.
-- `POST /agent_chat`: tool calling agent with chat memory and optional Supabase persistence.
+- It serves retrieval and chat APIs on top of indexed data.
 
-## End to End Flow
+## Overall Architecture
 
-### 1) Ingestion and indexing
+This repository has two RAG implementations:
 
-`POST /chunk` runs:
+1. Linear RAG implementation in `src/agents/rag` exposed by `POST /chat`.
+2. Agentic RAG with conversational memory in `src/agents/agentic_rag` (agent_rag) exposed by `POST /agent_chat`.
 
-1. Save uploaded PDF to `data/tmp`.
-2. Chunk with `PDFChunker` (`ppt`, `non_ppt`, `image_only`).
-3. Save extracted images to `data/images/{pdf_stem}`.
-4. Clean and embed chunk text.
-5. Store vectors in Chroma.
-6. Store text and metadata in SQLite + FTS5.
-7. Return indexing manifest JSON.
+Main path of this project is the agentic RAG endpoint `POST /agent_chat`.
 
-### 2) Retrieval
+### Linear RAG architecture (`/chat`)
 
-`POST /retrieve` runs:
+Linear RAG is a fixed sequence graph.
 
-1. Embed query.
-2. Vector search in Chroma.
-3. Optional BM25 text search in SQLite FTS5.
-4. Optional image payload attachment (`ref` or `blob`).
-5. Return `vector_results` and optional `text_results`.
+1. `retriever` gets vector and text candidates.
+2. If `images=true`, `image_blob_loader` reads image bytes from disk.
+3. `llm` generates the answer using retrieved context.
+4. `citation_validation` removes invalid citations and enforces strict grounding.
+5. `output` returns final answer, sources, usage, and image send stats.
 
-### 3) Agent layers
+### Agentic RAG architecture (`/agent_chat`)
 
-`POST /chat` graph:
+Agentic RAG is a tool calling graph with memory.
 
-1. `retriever`
-2. conditional route:
-3. if `images=true`: `image_blob_loader`
-4. then `llm`
-5. `citation_validation`
-6. `output`
+1. `input` loads conversation history from in memory cache if not fetches from Supabase.
+2. `llm_node` decides whether to call tools or answer directly for greeting messages.
+3. `tool_node` executes `retrieve` tool calls (up to 5 tool calls in one run).
+4. `citation_validation` validates the final answer against tool retrieved sources.
+5. `save_node` writes the final turn to cache and optional Supabase.
 
-`POST /agent_chat` graph:
+Conversational memory behavior:
 
-1. `input` (history load from memory and optional DB)
-2. `llm_node` (tool calling)
-3. `tool_node` (`retrieve` tool, max 5 calls)
-4. `citation_validation`
-5. `save_node` (response assembly and optional DB write)
+1. Recent turns are cached in process memory by `chat_id`.
+2. On each request, prior turns are loaded and inserted into the graph input.
+3. If Supabase is configured, turns are persisted and can be restored after restart.
 
-If evidence is not available, both chat flows can return:
+If evidence is missing, both chat implementations return:
 
 `Not found in the document.`
+
+## Chunking Strategy
+
+Chunking entrypoint is `PDFChunker` and supports `ppt`, `non_ppt`, and `image_only`.
+
+Standard profile for this project documentation is `pdf_type=ppt`.
+Other valid values are `non_ppt` and `image_only`.
+
+### `ppt`
+
+1. Processes page by page.
+2. Uses page screenshot and OCR for visual heavy slides.
+3. Produces `page_ocr` chunks and text chunks as available.
+4. Stores full page image references for multimodal answering.
+
+### `non_ppt`
+
+1. Detects mixed pages with text, tables, and visual regions.
+2. Extracts text chunks by configured granularity (`page`, `paragraph`, `heading`, `fixed`).
+3. Extracts table chunks with `extract_then_markdown` using `pdfplumber`, `camelot`, or `cascade`.
+4. Supports `ocr_first_then_construct` for OCR on cropped table images.
+5. Extracts visual chunks (`chunk_type=image`) for charts and diagrams.
+
+### `image_only`
+
+1. Targets scanned documents with minimal text layer.
+2. Runs OCR on rendered page images.
+3. Produces OCR driven searchable chunks.
+
+## Indexing and Storing Strategy
+
+After chunking, indexing runs through `embed_and_store`.
+
+1. Clean chunk text for embedding.
+2. Create embeddings with Google embedding model.
+3. Upsert vectors and lightweight metadata to Chroma.
+4. Insert full text and metadata JSON to SQLite.
+5. Maintain FTS5 index via triggers for BM25 retrieval.
+
+Storage breakdown:
+
+1. Chroma stores embeddings.
+2. Chroma stores lightweight metadata (`doc_id`, `page`, `chunk_type`, `image_path`, and document fields).
+3. SQLite stores full chunk text.
+4. SQLite stores cleaned text indexed in FTS5.
+5. SQLite stores rich metadata JSON including bbox and image dimensions.
+6. Filesystem stores extracted images under `data/images/{pdf_stem}`.
+7. Filesystem stores uploaded PDFs in `data/tmp`.
 
 ## Storage
 
@@ -132,19 +169,6 @@ LLM_MAX_TOKENS=10000
 LLM_TEMPERATURE=0
 ```
 
-Optional `.env` keys:
-
-- `EMBEDDING_MODEL`
-- `EMBED_BATCH_SIZE`
-- `DATA_DIR`
-- `CHROMA_DIR`
-- `SQLITE_PATH`
-- `IMAGES_DIR`
-- `TMP_DIR`
-- `CHROMA_COLLECTION`
-- `SUPABASE_URL`
-- `SUPABASE_KEY`
-
 ## Run
 
 ```bash
@@ -156,6 +180,8 @@ Docs:
 - `http://127.0.0.1:8000/docs`
 
 ## API
+
+Primary chat endpoint is `POST /agent_chat`.
 
 ### `POST /chunk`
 
@@ -169,7 +195,7 @@ Example:
 ```bash
 curl -X POST "http://127.0.0.1:8000/chunk" \
   -F "file=@/absolute/path/report.pdf" \
-  -F "pdf_type=non_ppt" \
+  -F "pdf_type=ppt" \
   -F "granularity=page"
 ```
 
@@ -179,7 +205,7 @@ Exact response JSON format:
 {
   "doc_id": "string",
   "source_file": "/absolute/path/to/saved/upload.pdf",
-  "pdf_type": "non_ppt",
+  "pdf_type": "ppt",
   "granularity": "page",
   "table_strategy": "extract_then_markdown",
   "table_engine": "pdfplumber",

@@ -89,7 +89,7 @@ async def chunk_endpoint(
     file: UploadFile = File(..., description="PDF file to process"),
 
     # ChunkingConfig params — all optional, defaults match ChunkingConfig dataclass
-    pdf_type:          str  = Form("non_ppt",                 description='"ppt" | "non_ppt" | "image_only"'),
+    pdf_type:          str  = Form("ppt",                     description='"ppt" | "non_ppt" | "image_only"'),
     granularity:       str  = Form("page",                    description='"page" | "paragraph" | "heading" | "fixed"'),
     max_tokens:        int  = Form(1024),
     token_overlap:     int  = Form(128),
